@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<base target="_top">
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f7fa;color:#163044;font:16px/1.6 system-ui,sans-serif}
+header{background:#123c53;color:white;padding:1rem max(1rem,calc((100% - 1100px)/2));font-size:1.3rem;font-weight:700}
+main{max-width:1100px;margin:auto;padding:1rem}h1,h2,h3,p{margin:.3rem 0 .7rem}
+.panel,article,fieldset{background:white;border:1px solid #cbd9e0;border-radius:12px;padding:1rem;margin-bottom:1rem;min-width:0}
+.bar{display:flex;align-items:end;flex-wrap:wrap;gap:.65rem;margin-bottom:1rem}.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start}
+label{display:block;font-weight:600}input,textarea,select,button{font:inherit;padding:.45rem .6rem;border-radius:6px;border:1px solid #78929f;color:inherit;background:white}
+label>input:not([type=checkbox]),label>textarea,label>select{display:block;width:100%;margin:.2rem 0 .65rem}
+textarea{min-height:6rem;resize:vertical}button{cursor:pointer}button.primary{background:#076751;color:white;border-color:#076751}
+button:disabled{opacity:.55;cursor:wait}.goal{background:#e7f6f0;border-left:5px solid #147c64;padding:.8rem;margin-bottom:1rem}
+.answer{white-space:pre-wrap;overflow-wrap:anywhere}#status{min-height:1.6em;color:#175348}#status.error{color:#a11d1d}details{margin:.5rem 0}summary{cursor:pointer}
+@media(max-width:730px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body><header>まなびの振り返り</header>
+<main><p id="status" role="status" aria-live="polite"></p><div id="app"></div></main>
+<script>
+'use strict';
+const app = document.querySelector('#app');
+const status = document.querySelector('#status');
+const stamps = ['👍', '👏', '💡', '🌱'];
+let home;
+let view;
+let requestNumber = 0;
+
+function el(tag, text, parent) {
+  const node = document.createElement(tag);
+  if (text != null) node.textContent = text;
+  if (parent) parent.append(node);
+  return node;
+}
+
+function message(text, error = false) {
+  status.textContent = text;
+  status.classList.toggle('error', error);
+}
+
+function rpc(action, data) {
+  return new Promise((resolve, reject) =>
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).api(action, data));
+}
+
+function button(parent, text, task, primary = false) {
+  const node = el('button', text, parent);
+  node.type = 'button';
+  if (primary) node.className = 'primary';
+  node.onclick = async () => {
+    node.disabled = true;
+    try { await task(); }
+    catch (error) { message(error.message || '処理に失敗しました。', true); }
+    finally { node.disabled = false; }
+  };
+  return node;
+}
+
+function control(parent, label, tag = 'input', value = '') {
+  const wrapper = el('label', label, parent);
+  const node = el(tag, null, wrapper);
+  node.value = value;
+  return node;
+}
+
+function select(parent, label, options, value) {
+  const node = control(parent, label, 'select');
+  options.forEach(([key, text]) => { el('option', text, node).value = key; });
+  if (options.some(([key]) => String(key) === String(value))) node.value = value;
+  return node;
+}
+
+function panel(parent) {
+  const node = el('section', null, parent);
+  node.className = 'panel';
+  return node;
+}
+
+function render() {
+  ++requestNumber;
+  app.replaceChildren();
+  el('h1', home.teacher ? '先生用ページ' : 'わたしの振り返り', app);
+  el('p', home.name + ' さん', app);
+  const toolbar = el('div', null, app);
+  toolbar.className = 'bar';
+  if (home.teacher) button(toolbar, '＋ 単元を登録', () => editUnit());
+  const subjects = [...new Set(home.units.map(unit => unit.subject))];
+  if (!subjects.length) { el('p', '登録されている単元はありません。', app); return; }
+  const subject = select(toolbar, '教科', subjects.map(value => [value, value]), view?.subject);
+  const unitHolder = el('div', null, toolbar);
+  const chooser = el('div', null, app);
+  const content = el('div', null, app);
+  function units() {
+    unitHolder.replaceChildren();
+    const options = home.units.filter(unit => unit.subject === subject.value);
+    const unit = select(unitHolder, '単元', options.map(item => [item.id, item.title]), view?.unit);
+    function chooseUnit() {
+      const current = options.find(item => item.id === unit.value);
+      view = { ...view, subject: subject.value, unit: current.id };
+      chooser.replaceChildren();
+      const goal = el('div', null, chooser);
+      goal.className = 'goal';
+      el('strong', '単元を貫くめあて', goal);
+      el('div', current.goal || '設定されていません', goal);
+      const bar = el('div', null, chooser);
+      bar.className = 'bar';
+      if (home.teacher) button(bar, '単元を編集', () => editUnit(current));
+      const person = home.teacher ? select(bar, '表示', [['', 'この時間の全児童'], ...home.students.map(item =>
+        [item.email, [item.number, item.name].filter(Boolean).join(' ')])], view.student) : null;
+      const period = select(bar, '授業時間', Array.from({length: current.hours}, (_, i) => [i + 1, '第' + (i + 1) + '時']), view.period);
+      async function load() {
+        const request = ++requestNumber;
+        const data = { unit: current.id, student: person?.value || '', period: Number(period.value) };
+        view = { ...view, ...data };
+        period.parentElement.hidden = Boolean(data.student);
+        content.replaceChildren(el('p', '読み込み中…'));
+        try {
+          const results = await rpc('read', data);
+          if (request !== requestNumber) return;
+          content.replaceChildren();
+          if (!home.teacher) renderStudent(content, current, data, results, load);
+          else if (data.student) {
+            const actions = el('div', null, content);
+            actions.className = 'bar';
+            button(actions, '児童別PDFを保存', async () => {
+              const file = await rpc('pdf', data);
+              const bytes = Uint8Array.from(atob(file.base64), char => char.charCodeAt(0));
+              const url = URL.createObjectURL(new Blob([bytes], {type: 'application/pdf'}));
+              const link = el('a', null, document.body);
+              link.href = url; link.download = file.name; link.click(); link.remove();
+              setTimeout(() => URL.revokeObjectURL(url), 1000);
+            });
+            if (home.ai) button(actions, 'AIで所見案をつくる', () => aiBox(content, actions, data));
+            if (!results.length) el('p', '振り返りはまだありません。', content);
+            results.forEach(item => showRecord(content, item, '第' + item.period + '時', data, load));
+          } else {
+            el('h2', '提出 ' + results.filter(item => item.record).length + ' / ' + results.length + '人', content);
+            results.forEach(item => showRecord(content, item.record, item.number + ' ' + item.name, data, load));
+          }
+        } catch (error) {
+          if (request !== requestNumber) return;
+          content.replaceChildren();
+          message(error.message, true);
+        }
+      }
+      if (person) person.onchange = load;
+      period.onchange = load;
+      load();
+    }
+    unit.onchange = chooseUnit;
+    chooseUnit();
+  }
+  subject.onchange = units;
+  units();
+}
+
+function showRecord(parent, item, title, data, reload) {
+  const card = el('article', null, parent);
+  el('h3', title, card);
+  if (!item) { el('p', '未記入', card); return; }
+  item.answers.forEach(answer => {
+    el('strong', answer.label, card);
+    const value = Array.isArray(answer.value) ? answer.value.join('、') : answer.value;
+    el('p', value || '未記入', card).className = 'answer';
+  });
+  item.feedback.forEach(reply => {
+    el('p', reply.name + '先生 ' + reply.stamp + (reply.comment ? '　' + reply.comment : ''), card).className = 'answer';
+  });
+  if (home.teacher) {
+    const edit = el('details', null, card);
+    el('summary', 'コメント・スタンプ', edit);
+    const own = item.feedback.find(reply => reply.mine);
+    const comment = control(edit, 'コメント', 'textarea', own?.comment || '');
+    const stamp = select(edit, 'スタンプ', [['', 'なし'], ...stamps.map(value => [value, value])], own?.stamp);
+    button(edit, '返信を保存', async () => {
+      await rpc('feedback', { ...data, record: item.id, comment: comment.value, stamp: stamp.value });
+      message('返信を保存しました。');
+      if (edit.isConnected) await reload();
+    }, true);
+  }
+}
+
+function renderStudent(parent, unit, data, records, reload) {
+  parent.className = 'grid';
+  const form = panel(parent);
+  const history = panel(parent);
+  el('h2', '第' + data.period + '時の振り返り', form);
+  el('h2', '同じ単元のこれまでの記録', history);
+  const earlier = records.filter(item => item.period < data.period).reverse();
+  if (!earlier.length) el('p', 'この時間より前の記録はありません。', history);
+  earlier.forEach(item => showRecord(history, item, '第' + item.period + '時'));
+  const current = records.find(item => item.period === data.period);
+  const inputs = (current?.fields || unit.fields).map(field => {
+    const saved = current?.answers.find(answer => answer.id === field.id)?.value;
+    return [field.id, answerInput(form, field, saved)];
+  });
+  button(form, '振り返りを保存', async () => {
+    await rpc('save', { ...data, revision: unit.revision, version: current?.version || 0,
+      answers: Object.fromEntries(inputs.map(([id, read]) => [id, read()])) });
+    message('振り返りを保存しました。');
+    if (form.isConnected) await reload();
+  }, true);
+  if (current?.feedback.length) {
+    el('h3', 'この時間の先生からの返信', form);
+    current.feedback.forEach(reply => {
+      el('p', reply.name + '先生 ' + reply.stamp + '　' + reply.comment, form).className = 'answer';
+    });
+  }
+}
+
+function answerInput(parent, field, saved) {
+  const label = field.label + (field.required ? '（必須）' : '');
+  if (field.type === 'single') {
+    const input = select(parent, label, [['', '選んでください'], ...field.options.map(value => [value, value])], saved);
+    return () => input.value;
+  }
+  if (field.type === 'multi') {
+    const box = el('fieldset', null, parent);
+    el('legend', label, box);
+    const checks = field.options.map(value => {
+      const line = el('label', null, box);
+      const input = el('input', null, line);
+      input.type = 'checkbox';
+      input.checked = (saved || []).includes(value);
+      line.append(' ' + value);
+      return [value, input];
+    });
+    return () => checks.filter(([, input]) => input.checked).map(([value]) => value);
+  }
+  const input = control(parent, label, 'textarea', saved || '');
+  if (field.examples.length || field.groups.length) {
+    const aid = el('details', null, parent);
+    el('summary', '書くヒントを使う', aid);
+    function insert(text) {
+      if (!text) return;
+      input.value += (input.value ? '\n' : '') + text;
+      input.focus();
+    }
+    if (field.examples.length) {
+      const example = select(aid, '例文', [['', '例文を選ぶ'], ...field.examples.map(value => [value, value])]);
+      button(aid, '例文を入れる', () => insert(example.value));
+    }
+    if (field.groups.length) {
+      const parts = field.groups.map(group => select(aid, group.label,
+        [['', '選んでください'], ...group.options.map(value => [value, value])]));
+      button(aid, '選んだ内容で文を入れる', () => {
+        if (parts.some(part => !part.value)) throw new Error('文づくりの候補をすべて選んでください。');
+        insert(field.template.replace(/\{(\d+)\}/g, (token, index) => parts[Number(index) - 1]?.value || token));
+      });
+    }
+  }
+  return () => input.value;
+}
+
+function splitLines(value) {
+  return value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+
+function editUnit(unit) {
+  ++requestNumber;
+  app.replaceChildren();
+  const editor = panel(app);
+  el('h1', unit ? '単元を編集' : '単元を登録', editor);
+  const subject = control(editor, '教科', 'input', unit?.subject);
+  const title = control(editor, '単元名', 'input', unit?.title);
+  const hours = control(editor, '全何時間か', 'input', unit?.hours || 4);
+  hours.type = 'number';
+  const goal = control(editor, '単元を貫くめあて', 'textarea', unit?.goal);
+  const fields = el('div', null, editor);
+  const readers = new Map();
+  function add(field = {}) {
+    const box = el('fieldset', null, fields);
+    el('legend', '振り返り項目', box);
+    const label = control(box, '質問文', 'input', field.label);
+    const type = select(box, '形式', [['text', '記述'], ['single', '一つ選ぶ'], ['multi', '複数選ぶ']], field.type);
+    const required = control(box, '必須にする');
+    required.type = 'checkbox';
+    required.checked = Boolean(field.required);
+    const options = control(box, '選択肢（1行に1件）', 'textarea', field.options?.join('\n'));
+    const supports = el('div', null, box);
+    const examples = control(supports, '例文（任意、1行に1件）', 'textarea', field.examples?.join('\n'));
+    const groups = el('div', null, supports);
+    const groupReaders = new Map();
+    function addGroup(group = {}) {
+      const section = el('fieldset', null, groups);
+      const name = control(section, '候補グループ名', 'input', group.label);
+      const choices = control(section, '候補（1行に1件）', 'textarea', group.options?.join('\n'));
+      groupReaders.set(section, () => ({ label: name.value, options: splitLines(choices.value) }));
+      button(section, '候補グループを削除', () => { groupReaders.delete(section); section.remove(); });
+    }
+    (field.groups || []).forEach(addGroup);
+    button(supports, '＋ 文づくりの候補グループ', () => addGroup());
+    const template = control(supports, '文の型（例「{1}を試すと、{2}が変わった。」）', 'input', field.template);
+    function sync() {
+      supports.hidden = type.value !== 'text';
+      options.parentElement.hidden = type.value === 'text';
+    }
+    type.onchange = sync;
+    sync();
+    readers.set(box, () => ({ label: label.value, type: type.value, required: required.checked,
+      options: splitLines(options.value), examples: splitLines(examples.value),
+      groups: [...groupReaders.values()].map(read => read()), template: template.value }));
+    button(box, 'この項目を削除', () => { readers.delete(box); box.remove(); });
+  }
+  (unit?.fields || [{}]).forEach(add);
+  const bar = el('div', null, editor);
+  bar.className = 'bar';
+  button(bar, '＋ 振り返り項目を追加', () => add());
+  button(bar, '戻る', render);
+  button(bar, '単元を保存', async () => {
+    const saved = await rpc('saveUnit', { id: unit?.id || '', revision: unit?.revision || 0,
+      subject: subject.value, title: title.value, hours: Number(hours.value), goal: goal.value,
+      fields: [...readers.values()].map(read => read()) });
+    home.units = [...home.units.filter(item => item.id !== saved.id), saved];
+    view = { subject: saved.subject, unit: saved.id };
+    message('単元を保存しました。');
+    render();
+  }, true);
+}
+
+async function aiBox(parent, actions, data) {
+  const preview = await rpc('aiPreview', data);
+  if (!actions.isConnected) return;
+  parent.querySelector('#ai-box')?.remove();
+  const box = el('section');
+  box.className = 'panel';
+  box.id = 'ai-box';
+  actions.after(box);
+  el('h2', 'AIに送る内容を確認', box);
+  el('p', '個人名などが本文にあれば削除してください。ここに表示された内容をAIに送ります。', box);
+  const input = control(box, '送信内容（編集できます）', 'textarea', preview);
+  button(box, 'この内容で所見案を作る', async () => {
+    const result = await rpc('aiGenerate', { ...data, text: input.value });
+    output.value = result;
+    output.focus();
+  }, true);
+  const output = control(box, '所見案と根拠（編集できます）', 'textarea');
+}
+
+message('学校アカウントを確認しています…');
+rpc('home', {}).then(result => {
+  home = result;
+  message('');
+  render();
+}).catch(error => message(error.message || '接続できませんでした。', true));
+</script>
+</body>
+</html>
